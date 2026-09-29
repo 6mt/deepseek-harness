@@ -177,12 +177,19 @@ export function apply(ctx: Context, config: Config = Config({})): void {
     }),
   }, EnterBehaviorRow))
 
+  /** Optional per-session availability a `conversation.view` registration may declare. */
+  type SessionViewOptions = {
+    available?: (session: { sessionId: SessionId }) => boolean
+  }
+  const viewAvailability = new Map<string, SessionViewOptions['available']>()
   const viewTabs = (): ViewTab[] => {
     const tabs: ViewTab[] = []
+    viewAvailability.clear()
     for (const entry of slots.entries('conversation.view')) {
       /* v8 ignore next -- list registration validates id at load. */
       if (entry.options.id === undefined) continue
       if (!ctx.configForms.developerTools.enabled.getSnapshot() && entry.options.id === TRAJECTORY_VIEW_ID) continue
+      viewAvailability.set(entry.options.id, (entry.options as SessionViewOptions).available)
       tabs.push({
         id: entry.options.id,
         label: resolveSlotLabel(entry.options.label) ?? entry.options.id,
@@ -190,14 +197,22 @@ export function apply(ctx: Context, config: Config = Config({})): void {
     }
     return tabs
   }
+  const viewAvailable = (sessionId: SessionId, view: string): boolean =>
+    viewAvailability.get(view)?.({ sessionId }) !== false
+  const sessionViewTabs = (sessionId: SessionId): readonly ViewTab[] =>
+    viewTabs().filter(tab => viewAvailable(sessionId, tab.id))
   const activateView = (sessionId: SessionId, preferred: string | null): void => {
-    const active = resolveActiveView(viewTabs(), preferred)
+    const active = resolveActiveView(sessionViewTabs(sessionId), preferred)
     if (active !== undefined) uiConversation.binding(sessionId).activate(active.id)
   }
   const restoreView = (sessionId: SessionId): void => {
     activateView(sessionId, readConversationViewPreference(sessionId))
   }
   const conversationViews = createSnapshotStore<readonly ViewTab[]>(viewTabs())
+  const sessionConversationViews = (sessionId: SessionId) => ({
+    getSnapshot: () => conversationViews.getSnapshot().filter(tab => viewAvailable(sessionId, tab.id)),
+    subscribe: (listener: () => void) => conversationViews.subscribe(listener),
+  })
   const bindings = new Set<SessionBinding>()
   const trackedBindings = new WeakSet<SessionBinding>()
   const trackBinding = (binding: SessionBinding): void => {
@@ -359,7 +374,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
     store: conversationStore,
     inject: (sessionId: SessionId, actions: BoundActions<typeof conversationStore>): ConversationSessionInjected => {
       const openView = (view: string, focus: string): void => {
-        if (!viewTabs().some(tab => tab.id === view)) return
+        if (!viewTabs().some(tab => tab.id === view) || !viewAvailable(sessionId, view)) return
         activateView(sessionId, view)
         actions.openView(view, focus)
       }
@@ -373,7 +388,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
       }
       return {
         hooks: {
-          conversationViews,
+          conversationViews: sessionConversationViews(sessionId),
           inspectCall: {
             getSnapshot: () => inspectionTarget() === undefined ? undefined : inspectCall,
             subscribe: (listener) => {
@@ -408,7 +423,7 @@ export function apply(ctx: Context, config: Config = Config({})): void {
     },
     store: conversationStore,
     inject: (sessionId: SessionId, actions: BoundActions<typeof conversationStore>): ConversationSessionHeaderInjected => ({
-      hooks: { conversationViews },
+      hooks: { conversationViews: sessionConversationViews(sessionId) },
       open: (id) => { workspaceNavigation.openSession(id) },
       selectView: (view) => {
         activateView(sessionId, view)
